@@ -2,7 +2,12 @@ import amqp from 'amqplib';
 import dotenv from 'dotenv';
 import path from 'path';
 import fs from 'fs';
-import { downloadFileFromS3 } from './s3';
+import { downloadFileFromS3, uploadFileToS3 } from './s3';
+
+import AdmZip from 'adm-zip';
+import { eq } from 'drizzle-orm';
+import { db } from './db';
+import { batches, lots, BatchStatus } from './db/schema';
 
 dotenv.config();
 
@@ -29,21 +34,27 @@ async function startWorker() {
 		await channel.consume(queueName, async msg => {
 			if (!msg) return;
 
+			// Парсим JSON из бинарного буфера сообщения
+			const taskData = JSON.parse(msg.content.toString());
+			console.log('\n--------------------------------------------------');
+			console.log('[Worker] New task from RabbitMQ!');
+			console.log('[Worker] Data:', taskData);
+
+			const { batchId, s3Key, fileName } = taskData;
+
+			// Определяем, куда локально сохраним скачанный архив
+			const localTempPath = path.join(
+				__dirname,
+				'../tmp',
+				`${batchId}-${fileName}`
+			);
+
 			try {
-				// Парсим JSON из бинарного буфера сообщения
-				const taskData = JSON.parse(msg.content.toString());
-				console.log('\n--------------------------------------------------');
-				console.log('[Worker] New task from RabbitMQ!');
-				console.log('[Worker] Data:', taskData);
-
-				const { batchId, s3Key, fileName } = taskData;
-
-				// Определяем, куда локально сохраним скачанный архив
-				const localTempPath = path.join(
-					__dirname,
-					'../tmp',
-					`${batchId}-${fileName}`
-				);
+				// 1. Update status in DB in case next didn't do it yet
+				await db
+					.update(batches)
+					.set({ status: BatchStatus.PROCESSING, progress: 40 })
+					.where(eq(batches.id, batchId));
 
 				console.log(
 					`[Worker] 1. Downloading archive from MinIO S3 (${s3Key})...`
@@ -53,11 +64,71 @@ async function startWorker() {
 					`[Worker] Successfully downloaded to local path: ${localTempPath}`
 				);
 
-				// TODO: next step is to unzip
-				// and store images to DB
+				// 3. Unpack archive adm-zip
+				console.log('[Worker] 2. Unpacking archive');
+				const zip = new AdmZip(localTempPath);
+				const zipEntries = zip.getEntries(); // list of files in archive
 
-				console.log('[Worker] Imitate long unpacking (3 sec)...');
-				await new Promise(resolve => setTimeout(resolve, 3000));
+				// Filter only images (ignore system files like __MACOSX)
+				const imageEntries = zipEntries.filter(
+					entry =>
+						!entry.isDirectory &&
+						(entry.entryName.endsWith('.jpg') ||
+							entry.entryName.endsWith('.png') ||
+							entry.entryName.endsWith('.jpeg'))
+				);
+
+				console.log(`[Worker] Number of image found: ${imageEntries.length}`);
+
+				// 4. process each image in a loop
+				for (let i = 0; i < imageEntries.length; i++) {
+					const entry = imageEntries[i];
+					const imageBuffer = entry.getData(); // binary buffer
+
+					// create cool name
+					const lotTitle = path.parse(entry.name).name.replace(/[-_]/g, ' ');
+
+					// store path inside MinIO
+					const processedS3Key = `processed-images/${batchId}/${entry.name}`;
+					const contentType = entry.name.endsWith('.png')
+						? 'image/png'
+						: 'image/jpeg';
+
+					console.log(
+						`[Worker] Processing image (${i + 1}/${
+							imageEntries.length
+						}): "${lotTitle}"`
+					);
+
+					//Save image to S3
+					await uploadFileToS3(imageBuffer, processedS3Key, contentType);
+
+					// create image record inside PostgreSQL via Drizzle
+					await db.insert(lots).values({
+						batchId: batchId,
+						title: lotTitle,
+						imageUrl: processedS3Key,
+					});
+
+					// calculate and update progress
+					const currentProgress = Math.round(
+						40 + ((i + 1) / imageEntries.length) * 50
+					); // from 40% to 90%
+					await db
+						.update(batches)
+						.set({ progress: currentProgress })
+						.where(eq(batches.id, batchId));
+				}
+
+				// 5. Final Update batch in DB
+				await db
+					.update(batches)
+					.set({
+						status: 'success',
+						progress: 100,
+						totalItems: imageEntries.length,
+					})
+					.where(eq(batches.id, batchId));
 
 				// Remove temp archive
 				if (fs.existsSync(localTempPath)) {
@@ -73,6 +144,12 @@ async function startWorker() {
 					'[Worker] ❌ Error while processig task:',
 					processingError
 				);
+
+				// set status failed in DB
+				await db
+					.update(batches)
+					.set({ status: BatchStatus.FAILED })
+					.where(eq(batches.id, batchId));
 
 				// In case of error return message to queue, not to lose data (requeue: true)
 				// in real prod use DLQ (Dead Letter Queue), but for start just return to queue

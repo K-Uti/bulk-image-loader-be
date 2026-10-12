@@ -1,4 +1,8 @@
-import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
+import {
+	S3Client,
+	GetObjectCommand,
+	PutObjectCommand,
+} from '@aws-sdk/client-s3';
 import { Readable } from 'stream';
 import fs from 'fs';
 import path from 'path';
@@ -41,4 +45,24 @@ export async function downloadFileFromS3(
 		stream.on('error', reject);
 		fileStream.on('finish', resolve);
 	});
+}
+
+// load image buffer to s3
+export async function uploadFileToS3(
+	buffer: Buffer,
+	s3Key: string,
+	contentType: string
+): Promise<string> {
+	const bucketName = process.env.S3_BUCKET_NAME || 'auction-bucket';
+
+	await s3Client.send(
+		new PutObjectCommand({
+			Bucket: bucketName,
+			Key: s3Key,
+			Body: buffer,
+			ContentType: contentType,
+		})
+	);
+
+	return s3Key;
 }
