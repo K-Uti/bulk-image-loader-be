@@ -2,7 +2,12 @@ import amqp from 'amqplib';
 import dotenv from 'dotenv';
 import path from 'path';
 import fs from 'fs';
-import { downloadFileFromS3, uploadFileToS3, deleteFileFromS3 } from './s3';
+import {
+	downloadFileFromS3,
+	uploadFileToS3,
+	deleteFileFromS3,
+	deleteFolderFromS3,
+} from './s3';
 
 import AdmZip from 'adm-zip';
 import { eq } from 'drizzle-orm';
@@ -141,22 +146,25 @@ async function startWorker() {
 					console.log(
 						`[Worker] Storing ${lotsToInsert.length} images to DB...`
 					);
-					await db.insert(lots).values(lotsToInsert);
+
+					await db.transaction(async tx => {
+						await tx.insert(lots).values(lotsToInsert);
+
+						// 7. Final Update batch in DB
+						await tx
+							.update(batches)
+							.set({
+								status: 'success',
+								progress: 100,
+								totalItems: imageEntries.length,
+							})
+							.where(eq(batches.id, batchId));
+					});
 				}
 
 				// 6. Clear s3 storage. delete initial zip file
 				console.log('[Worker] Deleting initial zip file from MinIO...');
 				await deleteFileFromS3(s3Key);
-
-				// 7. Final Update batch in DB
-				await db
-					.update(batches)
-					.set({
-						status: 'success',
-						progress: 100,
-						totalItems: imageEntries.length,
-					})
-					.where(eq(batches.id, batchId));
 
 				// Remove temp archive
 				if (fs.existsSync(localTempPath)) {
@@ -172,6 +180,11 @@ async function startWorker() {
 					'[Worker] ❌ Error while processig task:',
 					processingError
 				);
+
+				// COMPENSATE: Clear Minio: delete all images which we managed to upload
+				// because we didn't store anything in DB
+				const folderToClean = `processed-images/${batchId}/`;
+				await deleteFolderFromS3(folderToClean);
 
 				// set status failed in DB
 				await db

@@ -3,6 +3,8 @@ import {
 	GetObjectCommand,
 	PutObjectCommand,
 	DeleteObjectCommand,
+	ListObjectsV2Command,
+	DeleteObjectsCommand,
 } from '@aws-sdk/client-s3';
 import { Readable } from 'stream';
 import fs from 'fs';
@@ -75,4 +77,36 @@ export async function deleteFileFromS3(s3Key: string): Promise<void> {
 		new DeleteObjectCommand({ Bucket: bucketName, Key: s3Key })
 	);
 	console.log(`[S3] Initial archive is deleted: ${s3Key}`);
+}
+
+// Delete folder with all images from MinIO upon rollback
+export async function deleteFolderFromS3(folderPath: string): Promise<void> {
+	const bucketName = process.env.S3_BUCKET_NAME || 'auction-bucket';
+
+	try {
+		// 1. find all files inside that folder
+		const listCommand = new ListObjectsV2Command({
+			Bucket: bucketName,
+			Prefix: folderPath,
+		});
+		const listedObjects = await s3Client.send(listCommand);
+
+		if (!listedObjects.Contents || listedObjects.Contents.length === 0) return;
+
+		// 2. create array of keys for deleting
+		const deleteParams = {
+			Bucket: bucketName,
+			Delete: {
+				Objects: listedObjects.Contents.map(obj => ({ Key: obj.Key! })),
+			},
+		};
+
+		// 3. Delete everything
+		await s3Client.send(new DeleteObjectsCommand(deleteParams));
+		console.log(
+			`[S3-Rollback] Папка очищена от недописанных файлов: ${folderPath}`
+		);
+	} catch (error) {
+		console.error('[S3-Rollback] Не удалось очистить папку при откате:', error);
+	}
 }
