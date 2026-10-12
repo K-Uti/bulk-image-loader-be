@@ -2,6 +2,7 @@ import {
 	S3Client,
 	GetObjectCommand,
 	PutObjectCommand,
+	DeleteObjectCommand,
 } from '@aws-sdk/client-s3';
 import { Readable } from 'stream';
 import fs from 'fs';
@@ -65,4 +66,13 @@ export async function uploadFileToS3(
 	);
 
 	return s3Key;
+}
+
+// delete initially uploaded archive to MinIO
+export async function deleteFileFromS3(s3Key: string): Promise<void> {
+	const bucketName = process.env.S3_BUCKET_NAME;
+	await s3Client.send(
+		new DeleteObjectCommand({ Bucket: bucketName, Key: s3Key })
+	);
+	console.log(`[S3] Initial archive is deleted: ${s3Key}`);
 }

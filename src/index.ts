@@ -2,7 +2,7 @@ import amqp from 'amqplib';
 import dotenv from 'dotenv';
 import path from 'path';
 import fs from 'fs';
-import { downloadFileFromS3, uploadFileToS3 } from './s3';
+import { downloadFileFromS3, uploadFileToS3, deleteFileFromS3 } from './s3';
 
 import AdmZip from 'adm-zip';
 import { eq } from 'drizzle-orm';
@@ -80,6 +80,13 @@ async function startWorker() {
 
 				console.log(`[Worker] Number of image found: ${imageEntries.length}`);
 
+				// ARRAY to collect all the lots before pushing them to DB
+				const lotsToInsert: Array<{
+					batchId: string;
+					title: string;
+					imageUrl: string;
+				}> = [];
+
 				// 4. process each image in a loop
 				for (let i = 0; i < imageEntries.length; i++) {
 					const entry = imageEntries[i];
@@ -103,24 +110,45 @@ async function startWorker() {
 					//Save image to S3
 					await uploadFileToS3(imageBuffer, processedS3Key, contentType);
 
-					// create image record inside PostgreSQL via Drizzle
-					await db.insert(lots).values({
-						batchId: batchId,
+					// todo: too expensive update db on each iteration
+					//  create image record inside PostgreSQL via Drizzle
+					// await db.insert(lots).values({
+					// 	batchId: batchId,
+					// 	title: lotTitle,
+					// 	imageUrl: processedS3Key,
+					// });
+					// instead:
+
+					lotsToInsert.push({
+						batchId,
 						title: lotTitle,
 						imageUrl: processedS3Key,
 					});
 
-					// calculate and update progress
-					const currentProgress = Math.round(
-						40 + ((i + 1) / imageEntries.length) * 50
-					); // from 40% to 90%
-					await db
-						.update(batches)
-						.set({ progress: currentProgress })
-						.where(eq(batches.id, batchId));
+					// TODO: too expensive (maybe calculate 30% of upload 50% and 75 and update these values)
+					//  calculate and update progress
+					// const currentProgress = Math.round(
+					// 	40 + ((i + 1) / imageEntries.length) * 50
+					// ); // from 40% to 90%
+					// await db
+					// 	.update(batches)
+					// 	.set({ progress: currentProgress })
+					// 	.where(eq(batches.id, batchId));
 				}
 
-				// 5. Final Update batch in DB
+				// 5. Batch insert: one query to record all image objects at the same time
+				if (lotsToInsert.length > 0) {
+					console.log(
+						`[Worker] Storing ${lotsToInsert.length} images to DB...`
+					);
+					await db.insert(lots).values(lotsToInsert);
+				}
+
+				// 6. Clear s3 storage. delete initial zip file
+				console.log('[Worker] Deleting initial zip file from MinIO...');
+				await deleteFileFromS3(s3Key);
+
+				// 7. Final Update batch in DB
 				await db
 					.update(batches)
 					.set({
@@ -135,7 +163,7 @@ async function startWorker() {
 					fs.unlinkSync(localTempPath);
 				}
 
-				// 4. Confirm RabbitMQ that task is done
+				// 8. Confirm RabbitMQ that task is done
 				channel.ack(msg);
 				console.log('[Worker] ✅ Task is done! Message removed from queue');
 				console.log('--------------------------------------------------\n');
